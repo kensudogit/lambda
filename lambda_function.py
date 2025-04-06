@@ -30,6 +30,13 @@ import math
 os.environ["POSTS_TABLE_NAME"] = "wp_posts"
 os.environ["POSTMETA_TABLE_NAME"] = "wp_postmeta"
 
+# Define the constant at the top of your file
+APPLICATION_JSON = "application/json"
+ALLOWED_METHODS = "OPTIONS,POST,GET"
+ALLOWED_HEADERS = "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token"
+HTML_PARSER = 'html.parser'
+INTERNAL_SERVER_ERROR_MESSAGE = "Internal server error"
+
 # ロギングとトレーシングの設定
 logger = Logger(service="content_query_service", level="DEBUG")
 tracer = Tracer(service="content_query_service")
@@ -37,7 +44,7 @@ tracer = Tracer(service="content_query_service")
 # CORSConfigを正しく設定
 cors_config = CORSConfig(
     allow_origin="*",
-    allow_headers=["Content-Type", "X-Amz-Date", "Authorization", "X-Api-Key", "X-Amz-Security-Token"],
+    allow_headers=ALLOWED_HEADERS,
     max_age=300
 )
 
@@ -359,10 +366,10 @@ def create_response(status_code: int, body: dict) -> dict:
     return {
         "statusCode": status_code,
         "headers": {
-            "Content-Type": "application/json",
+            "Content-Type": APPLICATION_JSON,
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "OPTIONS,POST,GET",
-            "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token"
+            "Access-Control-Allow-Methods": ALLOWED_METHODS,
+            "Access-Control-Allow-Headers": ALLOWED_HEADERS
         },
         "body": body
     }
@@ -446,52 +453,29 @@ class ContentManager:
             self._add_debug_info("Returning cached posts")
             return self._posts_cache['_all_posts']
 
-        attr_site_code = [1, 2, 3]
-        if len(site_code) > 0:
-            logger.debug(f"get_all_posts() site_code : {site_code}")
-            attr_site_code = site_code;
+        attr_site_code = self._get_site_codes(site_code)
+        posts = self._fetch_posts(attr_site_code, limit)
+        
+        self._posts_cache['_all_posts'] = posts
+        return posts
 
+    def _get_site_codes(self, site_code: List[int]) -> List[int]:
+        """サイトコードを取得"""
+        if site_code:
+            logger.debug(f"get_all_posts() site_code : {site_code}")
+            return site_code
+        return [1, 2, 3]
+
+    def _fetch_posts(self, attr_site_code: List[int], limit: int) -> List[WpPost]:
+        """投稿を取得"""
         posts = []
         last_evaluated_key = None
         scan_count = 0
         
         while True:
-
-            if limit > 0:
-                response = posts_table.query(
-                    IndexName='post_status-post_date-index',
-                    KeyConditionExpression=Key('post_status').eq('publish'),
-                    ProjectionExpression='site_code,ID,post_title,post_content,post_date,guid,post_type',
-                    FilterExpression=Attr('site_code').is_in(attr_site_code) & Attr('post_type').is_in(['page', 'company']),
-                    ScanIndexForward=False
-                )
-                del response['Items'][limit::]
-                self._add_debug_info(f"Scan #{scan_count} returned {response}")
-            else:
-                if not last_evaluated_key:
-                    response = posts_table.query(
-                        IndexName='post_status-post_date-index',
-                        KeyConditionExpression=Key('post_status').eq('publish'),
-                        ProjectionExpression='site_code,ID,post_title,post_content,post_date, guid',
-                        FilterExpression=Attr('site_code').is_in(attr_site_code) & Attr('post_type').is_in(['page', 'company']),
-                        ScanIndexForward=False
-                    )
-                else:
-                    response = posts_table.query(
-                        IndexName='post_status-post_date-index',
-                        KeyConditionExpression=Key('post_status').eq('publish'),
-                        ProjectionExpression='site_code, ID, post_title, post_content, post_date, guid',
-                        FilterExpression=Attr('site_code').is_in(attr_site_code) & Attr('post_type').is_in(['page', 'company']),
-                        ExclusiveStartKey=last_evaluated_key,
-                        ScanIndexForward=False
-                    )
+            response = self._query_posts(attr_site_code, limit, last_evaluated_key)
             scan_count += 1
-            
-            items_count = len(response['Items'])
-            self._add_debug_info(f"Scan #{scan_count} returned {items_count} items")
-            
-            if items_count == 0:
-                self._add_debug_info("Warning: No items returned from scan")
+            self._add_debug_info(f"Scan #{scan_count} returned {len(response['Items'])} items")
             
             posts.extend([WpPost.from_dynamodb_item(item) for item in response['Items']])
             
@@ -500,68 +484,91 @@ class ContentManager:
             if not last_evaluated_key:
                 break
         
-        total_posts = len(posts)
-        self._add_debug_info(f"Total posts retrieved: {total_posts}")
-        
-        if total_posts == 0:
-            self._add_debug_info("Warning: No posts found in database")
-        
-        self._posts_cache['_all_posts'] = posts
+        self._add_debug_info(f"Total posts retrieved: {len(posts)}")
         return posts
+
+    def _query_posts(self, attr_site_code: List[int], limit: int, last_evaluated_key: Optional[dict]) -> dict:
+        """DynamoDBから投稿をクエリ"""
+        query_params = {
+            'IndexName': 'post_status-post_date-index',
+            'KeyConditionExpression': Key('post_status').eq('publish'),
+            'ProjectionExpression': 'site_code,ID,post_title,post_content,post_date,guid,post_type',
+            'FilterExpression': Attr('site_code').is_in(attr_site_code) & Attr('post_type').is_in(['page', 'company']),
+            'ScanIndexForward': False
+        }
+        
+        if last_evaluated_key:
+            query_params['ExclusiveStartKey'] = last_evaluated_key
+        
+        response = posts_table.query(**query_params)
+        
+        if limit > 0:
+            del response['Items'][limit::]
+        
+        return response
 
     @tracer.capture_method
     def analyze_content(self, post: WpPost, request_categories: List[str]) -> dict:
-        """
-        投稿内容から指定キーワードを抽出する
-        
-        Args:
-            post: WpPost オブジェクト
-            request_categories: 検索カテゴリーリスト
-        
-        Returns:
-            dict: 抽出結果を含む辞書
-        """
-        # 検索キーワードリスト
+        """投稿内容から指定キーワードを抽出する"""
         keywords = ['健康', '喫煙', '女性', '寿命']
-        
-        # 検索結果を格納する辞書
-        matches = {
+        matches = self._initialize_matches()
+
+        self._extract_title_matches(post, keywords, matches)
+        self._extract_content_matches(post, keywords, matches)
+        self._extract_category_matches(post, keywords, matches)
+
+        matches['total_matches'] = (
+            len(matches['title_matches']) +
+            len(matches['content_matches']) +
+            len(matches['category_matches'])
+        )
+
+        if matches['total_matches'] > 0:
+            logger.info(f"Found matches in post {post.ID}:")
+            logger.info(f"Title: {post.post_title}")
+            logger.info(f"Matches: {matches}")
+
+        return self._create_response(post, matches)
+
+    def _initialize_matches(self) -> dict:
+        """初期化されたマッチ辞書を返す"""
+        return {
             'title_matches': [],
             'content_matches': [],
             'category_matches': [],
             'total_matches': 0
         }
-        
-        # タイトルからの抽出
+
+    def _extract_title_matches(self, post: WpPost, keywords: List[str], matches: dict):
+        """タイトルからのマッチを抽出"""
         for keyword in keywords:
             if keyword in post.post_title:
                 matches['title_matches'].append({
                     'keyword': keyword,
                     'context': post.post_title
                 })
-        
-        # コンテンツからの抽出
+
+    def _extract_content_matches(self, post: WpPost, keywords: List[str], matches: dict):
+        """コンテンツからのマッチを抽出"""
         if post.post_content:
-            # HTMLタグを除去してプレーンテキスト化
-            soup = BeautifulSoup(post.post_content, 'html.parser')
-            plain_content = soup.get_text()
-            
+            soup = BeautifulSoup(post.post_content, HTML_PARSER)
             for keyword in keywords:
-                # キーワードを含む文脈を抽出（前後50文字）
-                if keyword in plain_content:
-                    # キーワードの位置を特定
-                    pos = plain_content.find(keyword)
-                    # 前後の文脈を取得（最大50文字）
-                    start = max(0, pos - 50)
-                    end = min(len(plain_content), pos + len(keyword) + 50)
-                    context = plain_content[start:end]
-                    
+                if keyword in soup.get_text().lower():
+                    context = self._get_context(soup.get_text().lower(), keyword)
                     matches['content_matches'].append({
                         'keyword': keyword,
                         'context': f"...{context}..."
                     })
-        
-        # カテゴリーからの抽出
+
+    def _get_context(self, content: str, keyword: str) -> str:
+        """キーワードを含む文脈を抽出（前後50文字）"""
+        pos = content.find(keyword)
+        start = max(0, pos - 50)
+        end = min(len(content), pos + len(keyword) + 50)
+        return content[start:end]
+
+    def _extract_category_matches(self, post: WpPost, keywords: List[str], matches: dict):
+        """カテゴリーからのマッチを抽出"""
         if hasattr(post, 'categories'):
             for keyword in keywords:
                 for category in post.categories:
@@ -570,22 +577,10 @@ class ContentManager:
                             'keyword': keyword,
                             'category': category
                         })
-        
-        # 総マッチ数を計算
-        matches['total_matches'] = (
-            len(matches['title_matches']) +
-            len(matches['content_matches']) +
-            len(matches['category_matches'])
-        )
-        
-        # デバッグログ出力
-        if matches['total_matches'] > 0:
-            logger.info(f"Found matches in post {post.ID}:")
-            logger.info(f"Title: {post.post_title}")
-            logger.info(f"Matches: {matches}")
-        
-        # クライアントへのレスポンス形式
-        response = {
+
+    def _create_response(self, post: WpPost, matches: dict) -> dict:
+        """レスポンスを作成"""
+        return {
             'status': 'success',
             'data': {
                 'post': {
@@ -625,11 +620,6 @@ class ContentManager:
             }
         }
 
-        # デバッグログ
-        logger.info(f"Analysis response for post {post.ID}: {json.dumps(response, ensure_ascii=False)}")
-        
-        return response
-
     @tracer.capture_method
     def search_content(self, keyword: str = None, site_code: int = [], limit: int = 0) -> List[Dict[str, Any]]:
         try:
@@ -654,11 +644,9 @@ class ContentManager:
                 if site_code is not None and post.site_code in site_code:
                     # キーワード検索
                     if keyword:
-                        soup = BeautifulSoup(post.post_content, 'html.parser')
-                        content_text = ' '.join(soup.get_text(separator=' ').split()).lower()
-                        keywords = keyword.replace("　", " ").split()
+                        soup = BeautifulSoup(post.post_content, HTML_PARSER)
                         if all(key.lower() in post.post_title.lower() or 
-                            key.lower() in content_text for key in keywords):
+                            key.lower() in soup.get_text().lower() for key in keyword.split()):
                             results.append({
                                 'id': post.ID,
                                 'title': post.post_title,
@@ -724,7 +712,7 @@ class ContentManager:
             
         return score
 
-def validate_search_params(keyword: Optional[str], category: Optional[str]) -> Tuple[bool, str]:
+def validate_search_params(keyword: Optional[str]) -> Tuple[bool, str]:
     """検索パラメータのバリデーション"""
     if keyword and len(keyword) > 100:
         return False, "Keyword too long"
@@ -740,9 +728,10 @@ def validate_category(category: Optional[str]) -> Tuple[bool, str]:
     Returns:
         Tuple[bool, str]: (有効かどうか, エラーメッセージ)
     """
-    if category is None:
+    valid_categories = ["category1", "category2", "category3"]  # Example valid categories
+    if category is None or category in valid_categories:
         return True, ""
-    return True, ""
+    return False, "Invalid category"
 
 # ミドルウェアの代わりに、エラーハンドリング用のデコレータを作成
 def error_handler(func):
@@ -768,268 +757,116 @@ def error_handler(func):
             
             return {
                 "statusCode": 500,
-                "headers": {"Content-Type": "application/json"},
+                "headers": {"Content-Type": APPLICATION_JSON},
                 "body": json.dumps({
-                    "error": "Internal Server Error",
+                    "error": INTERNAL_SERVER_ERROR_MESSAGE,
                     "details": error_details if os.getenv('DEBUG') == 'true' else None
                 })
             }
     return wrapper
 
-# 各エンドポイントハンドラーにエラーハンドリングを適用
-@app.post("/search")
-@error_handler
 @tracer.capture_method
 def search_handler():
     try:
         start_time = time.time()  # 開始時間を記録
         
-        # リクエストボディの取得と解析
-        body = get_body(app.current_event)
+        # Parse request and extract parameters
+        _, keyword, site_code, page, per_page, limit = parse_request(app.current_event)
         
-        # URLパラメータまたはボディからの検索条件取得
-        keyword = body.get('keyword', '') or body.get('word', '')
-        site_code_str = body.get('category')
-        page = int(body.get('page', 1))
-        per_page = int(body.get('per_page', 10))
-        limit = body.get('limit', 0)
+        # Retrieve activity reports
+        activity_report_results = retrieve_activity_reports(keyword, site_code, limit)
         
-        # site_codeのフィルタリング
-        site_code = filter_and_convert(site_code_str, ['1', '2', '3', '4'])
-        logger.debug(f"keyword :{keyword}")
-        logger.debug(f"sitecode :{site_code}")
-
-        # activity_reportの取得
-        activity_report_results = []
-        if 4 in site_code:
-            try:
-            
-                # マスタ_タグ取得
-                tag_master_result = tag_master_query()
-
-                # tag_codeからtag_nameに変換する
-                tag_code = ""
-                for key, value in tag_master_result.items():
-                    if value['tag_name'] == keyword:
-                        tag_code = value['tag_code']
-                        break
-                print(f"tag_code = {tag_code}")
-
-                # みんなの活動activity_reportの検索
-                # フィルター式の定義
-                activity_report_filter_expression = (
-                    Attr('delete_flag').eq(False) & 
-                    (
-                        Attr('activity_title').contains(keyword) | 
-                        Attr('overview').contains(keyword) | 
-                        Attr('issues').contains(keyword) | 
-                        Attr('results').contains(keyword) | 
-                        Attr('implementation_details').contains(keyword) | 
-                        Attr('implementation_highlights').contains(keyword) | 
-                        Attr('search_tags_list').contains(tag_code)
-                    )
-                )
-    #-------------------------------------------DBからデータ取得-------------------------------------------------------
-                if limit > 0:
-                    activity_report_scan_response = activity_report_table.query(
-                        IndexName='activity_report_status-updated_at-index',
-                        KeyConditionExpression=Key('activity_report_status').eq(4),
-                        ProjectionExpression='activity_report_id,user_id,activity_title,search_tags_list,file_name_list,file_s3_path_list,updated_at',
-                        FilterExpression=activity_report_filter_expression,
-                        ScanIndexForward=False)
-                    del activity_report_scan_response['Items'][limit::]
-                else:
-                    activity_report_scan_response = activity_report_table.query(
-                        IndexName='activity_report_status-updated_at-index',
-                        KeyConditionExpression=Key('activity_report_status').eq(4),
-                        ProjectionExpression='activity_report_id,user_id,activity_title,search_tags_list,file_name_list,file_s3_path_list,updated_at',
-                        FilterExpression=activity_report_filter_expression,
-                        ScanIndexForward=False)
-    #--------------------------------------------------------------------------------------------------        
-                
-                for item in activity_report_scan_response.pop('Items'):
-                    id = item.get('activity_report_id', '')
-                    user_id = item.get('user_id')
-
-                    # user_idから企業・団体・自治体名を取得する。
-                    name = ''
-                    if user_id:
-                        user_result = user_master_table.get_item(Key={'user_id': user_id})
-                        user = user_result.get('Item', None)
-                        if user:
-                            name = user.get('organization_name', '')
-
-                    # tag_codeからtag_nameに変換する
-                    tag_name_list = []
-                    if 'search_tags_list' in item:
-                        for tag_code in item['search_tags_list']:
-                            tag_item = tag_master_result.get(tag_code)
-                            if tag_item:
-                                tag_name_list.append(tag_item['tag_name'])
-
-                    activity_report_results.append(
-                        {
-                            'id': id,
-                            'title': item.get('activity_title', ''),
-                            'name': name,
-                            'content': item.get('overview', ''),
-                            'site_code': 4,
-                            'tags': tag_name_list,
-                            'files': item.get('file_name_list', []),
-                            'paths': item.get('file_s3_path_list', []),
-                            'url': f"/minna/content/{id}",
-                            'post_date': item.get('updated_at', '')
-                        }
-                    )
-
-                if keyword != '':
-                    logger.info(f"=== Search to activity_report by organization_name ===")
-                    # 企業・団体・自治体名による検索
-                    user_master_filter_expression = (
-                        Attr('delete_flag').eq(False) & Attr('organization_name').contains(keyword)
-                    )
-
-                    # DynamoDBのスキャン実行
-                    scan_results = []
-                    last_evaluated_key = None
-                    loop_count = 0
-                    while True:
-                        if not last_evaluated_key:
-                            user_master_scan_response = user_master_table.scan(
-                                FilterExpression=user_master_filter_expression,
-                                ProjectionExpression='user_id,organization_name'
-                            )
-                        else:
-                            user_master_scan_response = user_master_table.scan(
-                                FilterExpression=user_master_filter_expression,
-                                ProjectionExpression='user_id,organization_name',
-                                ExclusiveStartKey=last_evaluated_key
-                            )
-                        loop_count += 1
-                        logger.debug(f"loop : {loop_count} user_master_scan_response: {user_master_scan_response}")
-
-                        scan_results.extend(user_master_scan_response['Items'])
-
-                        last_evaluated_key = user_master_scan_response.get('LastEvaluatedKey')
-                        if not last_evaluated_key:
-                            break
-
-                    # user_idでactivity_reportテーブルのスキャン
-                    users = []
-                    for item in scan_results:
-                        users.append(item.get('user_id'))
-                    logger.debug(f"users : len = {len(users)}")
-
-                    activity_report_filter_expression = Attr('delete_flag').eq(False)
-                    if len(users) > 0:
-                        activity_report_filter_expression = activity_report_filter_expression & Attr('user_id').is_in(users)
-
-                    # DynamoDBのスキャン実行
-                    activity_report_scan_response = activity_report_table.scan(
-                        FilterExpression=activity_report_filter_expression,
-                        ProjectionExpression='activity_report_id,user_id,activity_title,search_tags_list,file_name_list,updated_at'
-                    )
-                    logger.info(activity_report_scan_response)
-
-                    for record in activity_report_scan_response.get('Items', []):
-                        id = record.get('activity_report_id', '')
-                        # 重複チェック
-                        if any(id == activity_report['id'] for activity_report in activity_report_results):
-                            continue
-
-                        # tag_codeからtag_nameに変換する
-                        tag_name_list = []
-                        if 'search_tags_list' in record:
-                            for tag_code in record['search_tags_list']:
-                                tag_item = tag_master_result.get(tag_code)
-                                if tag_item:
-                                    tag_name_list.append(tag_item['tag_name'])
-
-                        activity_report_results.append(
-                            {
-                                'id': id,
-                                'title': record.get('activity_title', ''),
-                                'name': item.get('organization_name', ''),
-                                'content': record.get('overview', ''),
-                                'site_code': 4,
-                                'tags': tag_name_list,
-                                'files': record.get('file_name_list', []),
-                                'url': f"/minna/content/{id}",
-                                'post_date': record.get('updated_at', '')
-                            }
-                        )
-
-                logger.info(f"=== Search for activity_report: {activity_report_results} ===")
-                logger.info(activity_report_results)
-                logger.info(f"Total activity_report_results count: {len(activity_report_results)}")
-            
-            except Exception as e:
-                logger.error(f"Error fetching search activity_report: {str(e)}")
-                logger.error(f"Stack trace: {traceback.format_exc()}")
-                activity_report_results = []
-
-        # 基本検索の実行
-        basic_results = []
-        if 1 in site_code or 2 in site_code or 3 in site_code:
-            manager = ContentManager()
-            basic_result = manager.search_content(keyword, site_code, limit)
-            logger.info(basic_result)
-            basic_results = basic_result.get('results', [])
-
-        if len(basic_results) > 0 and len(activity_report_results) > 0:
-            basic_results.extend(activity_report_results)
-        elif len(basic_results) == 0 and len(activity_report_results) > 0:
-            basic_results = activity_report_results
-
-        # 公開日が新しいもの順にソート
-        basic_results.sort(key=lambda x: x['post_date'], reverse=True)
-        if limit > 0:
-            del basic_results[limit::]
-
-        # レスポンスの作成
-        search_response = {
-            "status": "success",
-            "results": basic_results,
-            "pagination": {
-                "total": len(basic_results),
-                "page": page,
-                "per_page": per_page
-            },
-            "search_metadata": {
-                "execution_time": time.time() - start_time
-                # "keywords_found": len(basic_result.get('matches', {}).get('keyword_matches', [])),
-            }
-        }
+        # Execute basic search
+        basic_results = execute_basic_search(keyword, site_code, limit)
         
-        return {
-            "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "OPTIONS,POST,GET",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token"
-            },
-            "body": convert_decimal(search_response)
-        }
-            
+        # Combine and sort results
+        combined_results = combine_and_sort_results(basic_results, activity_report_results, limit)
+        
+        # Create response
+        return create_search_response(combined_results, page, per_page, start_time)
+        
     except Exception as e:
         logger.error(f"Error in search handler: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
-        return {
-            "statusCode": 500,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "OPTIONS,POST,GET",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token"
-            },
-            "body": {
-                "status": "error",
-                "message": "検索処理に失敗しました",
-                "error": str(e) if os.getenv('DEBUG') == 'true' else None
-            }
+        return create_response(500, {
+            "status": "error",
+            "message": INTERNAL_SERVER_ERROR_MESSAGE,
+            "error": str(e) if os.getenv('DEBUG') == 'true' else None
+        })
+
+def parse_request(event):
+    """Parse the request and extract parameters."""
+    body = get_body(event)
+    keyword = body.get('keyword', '') or body.get('word', '')
+    site_code_str = body.get('category')
+    page = int(body.get('page', 1))
+    per_page = int(body.get('per_page', 10))
+    limit = body.get('limit', 0)
+    site_code = filter_and_convert(site_code_str, ['1', '2', '3', '4'])
+    logger.debug(f"keyword :{keyword}")
+    logger.debug(f"sitecode :{site_code}")
+    return body, keyword, site_code, page, per_page, limit
+
+def retrieve_activity_reports(keyword, site_code, limit):
+    """Retrieve activity reports based on the keyword and site code."""
+    activity_report_results = []
+    if 4 in site_code:
+        try:
+            tag_master_result = tag_master_query()
+            tag_code = get_tag_code(keyword, tag_master_result)
+            activity_report_results = query_activity_reports(tag_code, keyword, limit)
+        except Exception as e:
+            logger.error(f"Error fetching search activity_report: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+    return activity_report_results
+
+def execute_basic_search(keyword, site_code, limit):
+    """Execute the basic search."""
+    basic_results = []
+    if 1 in site_code or 2 in site_code or 3 in site_code:
+        manager = ContentManager()
+        basic_result = manager.search_content(keyword, site_code, limit)
+        logger.info(basic_result)
+        basic_results = basic_result.get('results', [])
+    return basic_results
+
+def combine_and_sort_results(basic_results, activity_report_results, limit):
+    """Combine and sort the search results."""
+    if len(basic_results) > 0 and len(activity_report_results) > 0:
+        basic_results.extend(activity_report_results)
+    elif len(basic_results) == 0 and len(activity_report_results) > 0:
+        basic_results = activity_report_results
+
+    basic_results.sort(key=lambda x: x['post_date'], reverse=True)
+    if limit > 0:
+        del basic_results[limit::]
+    return basic_results
+
+def create_search_response(results, page, per_page, start_time):
+    """Create the search response."""
+    search_response = {
+        "status": "success",
+        "results": results,
+        "pagination": {
+            "total": len(results),
+            "page": page,
+            "per_page": per_page
+        },
+        "search_metadata": {
+            "execution_time": time.time() - start_time
         }
-    
+    }
+    return {
+        "statusCode": 200,
+        "headers": {
+            "Content-Type": APPLICATION_JSON,
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": ALLOWED_METHODS,
+            "Access-Control-Allow-Headers": ALLOWED_HEADERS
+        },
+        "body": convert_decimal(search_response)
+    }
+
 def filter_and_convert(input_list, valid_numbers):
     return [int(num) for num in input_list if num in valid_numbers]
 
@@ -1056,7 +893,7 @@ def categories_handler():
         
         for post in posts:
             # 投稿のコンテンツからカテゴリを抽出
-            soup = BeautifulSoup(post.post_content, 'html.parser')
+            soup = BeautifulSoup(post.post_content, HTML_PARSER)
             content_text = soup.get_text().lower()
             # ここでカテゴリの抽出ロジックを実装
             # 例: タグやカテゴリ関連のメタデータから抽出
@@ -1067,7 +904,7 @@ def categories_handler():
         })
     except Exception as e:
         logger.error(f"Error in categories_handler: {str(e)}")
-        return create_response(500, {"error": "Internal server error"})
+        return create_response(500, {"error": INTERNAL_SERVER_ERROR_MESSAGE})
 
 def record_metrics(func):
     @wraps(func)
@@ -1114,7 +951,7 @@ def external_contents_handler() -> dict:
         })
     except Exception as e:
         logger.error(f"Error in external_contents_handler: {str(e)}")
-        return create_response(500, {"error": "Internal server error"})
+        return create_response(500, {"error": INTERNAL_SERVER_ERROR_MESSAGE})
 
 @app.post("/health")
 @error_handler
@@ -1131,7 +968,7 @@ def health_check():
         }
 
         try:
-            if not is_initialized:
+            if not is_initialized and not synchronous_init():
                 return create_response(503, {
                     "status": "initializing",
                     "details": health_status,
@@ -1272,12 +1109,12 @@ def create_error_response(error: Exception, context: LambdaContext = None) -> di
     error_response = {
         "statusCode": 500,
         "headers": {
-            "Content-Type": "application/json",
+            "Content-Type": APPLICATION_JSON,
             "Access-Control-Allow-Origin": "*",
             "X-Error-Type": type(error).__name__
         },
         "body": json.dumps({
-            "message": "Internal server error",
+            "message": INTERNAL_SERVER_ERROR_MESSAGE,
             "error_type": type(error).__name__,
             "error_details": str(error) if is_debug else None,
             "request_id": context.aws_request_id if context else None,
@@ -1312,7 +1149,7 @@ def get_memory_info() -> Dict[str, Any]:
                 page_size = os.sysconf('SC_PAGE_SIZE')
                 memory_info["virtual_memory"] = int(stats[0]) * page_size / (1024 * 1024)  # MB単位
                 memory_info["resident_memory"] = int(stats[1]) * page_size / (1024 * 1024)  # MB単位
-        except:
+        except Exception:
             pass  # /proc/self/statmが利用できない場合は無視
             
         return memory_info
@@ -1324,12 +1161,11 @@ def get_memory_info() -> Dict[str, Any]:
 def lambda_handler(event: dict, context: LambdaContext) -> dict:
     """Lambda関数のメインハンドラー"""
     try:
-        if not is_initialized:
-            if not synchronous_init():
-                return create_response(500, {
-                    "error": "Service initialization failed",
-                    "request_id": context.aws_request_id
-                })
+        if not is_initialized and not synchronous_init():
+            return create_response(500, {
+                "error": "Service initialization failed",
+                "request_id": context.aws_request_id
+            })
 
         logger.debug(event)
         if "httpMethod" in event:
@@ -1338,7 +1174,7 @@ def lambda_handler(event: dict, context: LambdaContext) -> dict:
             except Exception as e:
                 logger.error(f"API Gateway resolution error: {str(e)}")
                 return create_response(500, {
-                    "error": "Internal server error",
+                    "error": INTERNAL_SERVER_ERROR_MESSAGE,
                     "details": str(e) if os.getenv('DEBUG') == 'true' else None
                 })
         
@@ -1358,7 +1194,7 @@ def lambda_handler(event: dict, context: LambdaContext) -> dict:
     except Exception as e:
         logger.error(f"Fatal error in lambda_handler: {str(e)}")
         return create_response(500, {
-            "error": "Internal server error",
+            "error": INTERNAL_SERVER_ERROR_MESSAGE,
             "details": str(e) if os.getenv('DEBUG') == 'true' else None
         })
 
@@ -1428,7 +1264,7 @@ def get_search_tags_handler():
         logger.error(f"Error in get_search_tags_handler: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
         return create_response(500, {
-            "error": "Internal server error",
+            "error": INTERNAL_SERVER_ERROR_MESSAGE,
             "details": str(e) if os.getenv('DEBUG') == 'true' else None
         })
 
@@ -1486,195 +1322,101 @@ async def search_content_advanced(
     page: int = 1,
     per_page: int = 10
 ) -> Dict[str, Any]:
-    """
-    投稿コンテンツの高度な検索を行う関数
-    
-    Args:
-        keyword (str, optional): 検索キーワード
-        tags (List[str], optional): 検索タグのリスト
-        page (int): ページ番号（1から開始）
-        per_page (int): 1ページあたりの結果数
-        
-    Returns:
-        Dict[str, Any]: 検索結果と関連情報を含む辞書
-    """
-    start_time = time.time()  # 開始時間を記録
+    start_time = time.time()
     try:
         manager = ContentManager()
         posts = manager.get_all_posts()
         matched_posts = []
-        
-        # 検索条件の準備
-        if keyword:
-            keywords = [k.lower().strip() for k in keyword.split()]
-        else:
-            keywords = []
-            
-        tags = [t.lower().strip() for t in (tags or [])]
-        
+
+        keywords = process_keywords(keyword)
+        tags = process_tags(tags)
+
         for post in posts:
-            score = 0
-            matches = {
-                'keyword_matches': [],
-                'tag_matches': [],
-                'title_matches': False
-            }
-            
-            # タイトルとコンテンツをBeautifulSoupで解析
-            soup = BeautifulSoup(post.post_content, 'html.parser')
-            content_text = soup.get_text().lower()
-            title_text = post.post_title.lower()
-            
-            # キーワード検索
-            if keywords:
-                for kw in keywords:
-                    # タイトルでの一致（高いスコア）
-                    if kw in title_text:
-                        score += 10
-                        matches['keyword_matches'].append({
-                            'type': 'title',
-                            'keyword': kw
-                        })
-                        matches['title_matches'] = True
-                    
-                    # コンテンツでの一致
-                    if kw in content_text:
-                        score += 5
-                        matches['keyword_matches'].append({
-                            'type': 'content',
-                            'keyword': kw
-                        })
-            
-            # タグ検索
-            if tags:
-                for tag in tags:
-                    if tag in content_text or tag in title_text:
-                        score += 3
-                        matches['tag_matches'].append(tag)
-            
-            # スコアが0より大きい場合のみ結果に追加
+            score, matches = calculate_score(post, keywords, tags)
             if score > 0:
-                # コンテンツの要約を生成（最初の200文字）
-                summary = content_text[:200] + '...' if len(content_text) > 200 else content_text
-                
-                # ハイライト処理
-                highlighted_title = post.post_title
-                highlighted_summary = summary
-                
-                for kw in keywords:
-                    # タイトルのハイライト
-                    highlighted_title = re.sub(
-                        f'({kw})',
-                        r'<mark>\1</mark>',
-                        highlighted_title,
-                        flags=re.IGNORECASE
-                    )
-                    
-                    # サマリーのハイライト
-                    highlighted_summary = re.sub(
-                        f'({kw})',
-                        r'<mark>\1</mark>',
-                        highlighted_summary,
-                        flags=re.IGNORECASE
-                    )
-                
-                matched_posts.append({
-                    'id': post.ID,
-                    'title': highlighted_title,
-                    'original_title': post.post_title,
-                    'summary': highlighted_summary,
-                    'score': score,
-                    'matches': matches,
-                    'url': post.guid,
-                    'post_date': post.post_date
-                })
-        
-        # スコアでソート
+                matched_posts.append(create_matched_post(post, score, matches, keywords))
+
         matched_posts.sort(key=lambda x: (-x['score'], x['post_date']), reverse=True)
-        
-        # ページネーション
-        start_idx = (page - 1) * per_page
-        end_idx = start_idx + per_page
-        paginated_posts = matched_posts[start_idx:end_idx]
-        
-        # レスポンスの作成
-        response = {
-            'results': paginated_posts,
-            'pagination': {
-                'current_page': page,
-                'per_page': per_page,
-                'total_pages': math.ceil(len(matched_posts) / per_page),
-                'total_results': len(matched_posts)
-            },
-            'search_info': {
-                'keywords': keywords,
-                'tags': tags,
-                'execution_time': time.time() - start_time
-            }
-        }
-        
-        return response
-        
+        paginated_posts = paginate_results(matched_posts, page, per_page)
+
+        return create_response_dict(paginated_posts, page, per_page, matched_posts, start_time, keywords, tags)
+
     except Exception as e:
         logger.error(f"Error in search_content_advanced: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
         raise
 
-# APIエンドポイントハンドラー
-@app.post("/search-advanced")
-@error_handler
-@tracer.capture_method
-def search_advanced_handler():
-    """高度な検索APIのハンドラー"""
-    try:
-        # リクエストボディの取得と検証
-        if not app.current_event.body:
-            return create_response(400, {
-                "error": "Missing request body"
-            })
-            
-        body = json.loads(app.current_event.body)
-        
-        # パラメータの取得
-        keyword = body.get('keyword', '')
-        tags = body.get('tags', [])
-        page = int(body.get('page', 1))
-        per_page = min(int(body.get('per_page', 10)), 50)  # 最大50件まで
-        
-        # 入力値の検証
-        if page < 1:
-            return create_response(400, {
-                "error": "Page number must be greater than 0"
-            })
-            
-        if per_page < 1:
-            return create_response(400, {
-                "error": "Per page must be greater than 0"
-            })
-            
-        # 検索の実行
-        loop = asyncio.get_event_loop()
-        results = loop.run_until_complete(
-            search_content_advanced(
-                keyword=keyword,
-                tags=tags,
-                page=page,
-                per_page=per_page
-            )
-        )
-        
-        return create_response(200, results)
-        
-    except json.JSONDecodeError:
-        return create_response(400, {
-            "error": "Invalid JSON format in request body"
-        })
-    except Exception as e:
-        logger.error(f"Error in search_advanced_handler: {str(e)}")
-        return create_response(500, {
-            "error": "Internal server error",
-            "details": str(e) if os.getenv('DEBUG') == 'true' else None
-        })
+def process_keywords(keyword: str) -> List[str]:
+    return [k.lower().strip() for k in keyword.split()] if keyword else []
+
+def process_tags(tags: List[str]) -> List[str]:
+    return [t.lower().strip() for t in (tags or [])]
+
+def calculate_score(post: WpPost, keywords: List[str], tags: List[str]) -> Tuple[int, Dict[str, Any]]:
+    score = 0
+    matches = {'keyword_matches': [], 'tag_matches': [], 'title_matches': False}
+    soup = BeautifulSoup(post.post_content, HTML_PARSER)
+
+    for kw in keywords:
+        if kw in post.post_title.lower():
+            score += 10
+            matches['keyword_matches'].append({'type': 'title', 'keyword': kw})
+            matches['title_matches'] = True
+        if kw in soup.get_text().lower():
+            score += 5
+            matches['keyword_matches'].append({'type': 'content', 'keyword': kw})
+
+    for tag in tags:
+        if tag in soup.get_text().lower():
+            score += 3
+            matches['tag_matches'].append(tag)
+
+    return score, matches
+
+def create_matched_post(post: WpPost, score: int, matches: Dict[str, Any], keywords: List[str]) -> Dict[str, Any]:
+    summary = create_summary(post)
+    highlighted_title, highlighted_summary = highlight_matches(post.post_title, summary, keywords)
+    return {
+        'id': post.ID,
+        'title': highlighted_title,
+        'original_title': post.post_title,
+        'summary': highlighted_summary,
+        'score': score,
+        'matches': matches,
+        'url': post.guid,
+        'post_date': post.post_date
+    }
+
+def create_summary(post: WpPost) -> str:
+    soup = BeautifulSoup(post.post_content, HTML_PARSER)
+    return soup.get_text()[:200] + '...' if len(soup.get_text()) > 200 else soup.get_text()
+
+def highlight_matches(title: str, summary: str, keywords: List[str]) -> Tuple[str, str]:
+    for kw in keywords:
+        title = re.sub(f'({kw})', r'<mark>\1</mark>', title, flags=re.IGNORECASE)
+        summary = re.sub(f'({kw})', r'<mark>\1</mark>', summary, flags=re.IGNORECASE)
+    return title, summary
+
+def paginate_results(matched_posts: List[Dict[str, Any]], page: int, per_page: int) -> List[Dict[str, Any]]:
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    return matched_posts[start_idx:end_idx]
+
+def create_response_dict(paginated_posts: List[Dict[str, Any]], page: int, per_page: int, matched_posts: List[Dict[str, Any]], start_time: float, keywords: List[str], tags: List[str]) -> Dict[str, Any]:
+    return {
+        'results': paginated_posts,
+        'pagination': {
+            'current_page': page,
+            'per_page': per_page,
+            'total_pages': math.ceil(len(matched_posts) / per_page),
+            'total_results': len(matched_posts)
+        },
+        'search_info': {
+            'keywords': keywords,
+            'tags': tags,
+            'execution_time': time.time() - start_time
+        }
+    }
 
 def get_body(event: dict) -> dict:
     """リクエストボディを取得して解析する"""
@@ -1719,3 +1461,32 @@ def tag_master_query():
 
     #データ返却
     return tag_list
+
+def get_tag_code(keyword: str, tag_master_result: Dict[str, Dict[str, Any]]) -> str:
+    """Retrieve the tag code for a given keyword from the tag master result."""
+    for tag_code, tag_info in tag_master_result.items():
+        if tag_info.get('tag_name') == keyword:
+            return tag_code
+    return ""
+
+def query_activity_reports(tag_code: str, keyword: str, limit: int) -> List[Dict[str, Any]]:
+    """Query the activity report table for reports matching the tag code and keyword."""
+    try:
+        # Define the filter expression
+        filter_expression = (
+            Attr('tag_code').eq(tag_code) &
+            Attr('keyword').contains(keyword) &
+            Attr('delete_flag').eq(False)
+        )
+        
+        # Query the table
+        response = activity_report_table.scan(
+            FilterExpression=filter_expression,
+            Limit=limit
+        )
+        
+        # Extract and return the items
+        return response.get('Items', [])
+    except Exception as e:
+        logger.error(f"Error querying activity reports: {str(e)}")
+        return []
